@@ -24,11 +24,12 @@ def main(
         model_name,
         reference_et,
         project_id,
+        crs,
         start_date,
         end_date,
-        crs,
-        # extent=None,
+        clip_study_area=False,
         drive_folder='',
+        extent=None,
         mgrs_tiles=None,
         timestep='monthly',
         coll_version='v2_1',
@@ -49,22 +50,28 @@ def main(
         Exclusive end date in ISO date format (YYYY-MM-DD).
     crs : str
         Coordinate Reference System (crs) EPSG string (e.g. "EPSG:XXXX")
+    clip : bool
+        If True, clip to the study area collection geometry.
+        Note that this may use considerable EECU.
     drive_folder : str
         Images can be saved to a subfolder in your Google Drive,
         but this may cause problems with duplicate folders, so the default is
         to write to the root folder.
+    extent :
+        Bounding extent.
     mgrs_tiles : list
         List of specific MGRS grid zones to process.  The default is to process
         all MGRS grid zones that intersect the study area collection.
     timestep : {'monthly'}
-        Only monthly time steps are currently supported
+        Only exports for monthly time steps are currently supported.
     coll_version : {'v2_1', 'v2_0'}
-        OpenET collection version number
+        OpenET collection version number.  Note that the spatial and temporal
+        coverage of the two collections may vary and there is no v2.0 data
+        available for 2025+.
     """
 
     # Other input parameters
     # These may be made input function parameters in the future
-    clip_study_area_flag = False
 
     # File naming format (e.g. "ensemble_gridmet_monthly_20260201_10S.tif")
     tif_name_fmt = f'{model_name}_{reference_et}_{timestep}_{{date}}.tif'
@@ -95,7 +102,19 @@ def main(
     logging.info(f'  {start_date.strftime("%Y-%m-%d")}')
     logging.info(f'  {end_date.strftime("%Y-%m-%d")}')
 
-    ########
+    # Build the collection ID
+    if reference_et.lower() == 'gridmet':
+        region = 'conus/gridmet'
+    elif reference_et.lower() == 'cimis':
+        region = 'california/cimis'
+    else:
+        raise ValueError(f'Unsupported reference ET dataset keyword: {reference_et}')
+
+    # 'projects/openet/assets/ensemble/conus/gridmet/monthly/v2_1'
+    month_coll_id = (
+        f'projects/openet/assets/{model_name.lower()}/'
+        f'{region.lower()}/{timestep.lower()}/{coll_version.lower()}'
+    )
 
     # Initialize Earth Engine
     ee.Initialize(project=project_id)
@@ -175,7 +194,6 @@ def main(
         int(math.ceil((study_area_extent[3] - snap_y) / cs)) * cs + snap_y,
     ]
     logging.debug(f'Export Extent: {export_extent}')
-    input('ENTER')
 
     ########
 
@@ -218,20 +236,6 @@ def main(
         dtype_min = None
         dtype_max = None
 
-    # Build the collection ID
-    if reference_et.lower() == 'gridmet':
-        region = 'conus/gridmet'
-    elif reference_et.lower() == 'cimis':
-        region = 'california/cimis'
-    else:
-        raise ValueError(f'Unsupported reference ET dataset: {reference_et}')
-
-    # 'projects/openet/assets/ensemble/conus/gridmet/monthly/v2_1'
-    month_coll_id = (
-        f'projects/openet/assets/{model_name.lower()}/'
-        f'{region.lower()}/{timestep.lower()}/{coll_version.lower()}'
-    )
-
     # Build the date ranges to process
     iter_dates = [
         datetime(y, m, 1)
@@ -247,7 +251,7 @@ def main(
 
     # Export the images
     for iter_start_date, iter_end_date in iter_dates:
-        logging.info(f'{iter_start_date} {iter_end_date}')
+        logging.info(f'\n{iter_start_date} {iter_end_date}')
 
         # Build date strings for filterDate calls
         iter_start_dt = datetime.strptime(iter_start_date, '%Y-%m-%d')
@@ -306,7 +310,7 @@ def main(
         # Cast to the target datatype
         output_img = output_img.cast({v: output_dtype for v in variables})
 
-        if clip_study_area_flag:
+        if clip_study_area:
             output_img = output_img.clip(study_area_geom)
 
         # # Apply a mask to the output image
@@ -391,14 +395,16 @@ def arg_parse():
                  relativedelta(months=end_month_offset)).strftime('%Y-%m-%d'),
         help='End date (format YYYY-MM-DD)')
     parser.add_argument(
+        '--clip', default=False, action='store_true',
+        help='Clip to the study area collection geometry')
+    parser.add_argument(
         '--epsg', type=int, metavar='EPSG:XXXX',
         help='EPSG code number for the target coordinate reference system (CRS)')
-    # CGM - Extent parameter is not yet supported
-    # parser.add_argument(
-    #     '--extent', default=None, nargs='+', metavar='xmin ymin xmax ymax',
-    #     help='Bounding extent')
     parser.add_argument(
-        '--folder', default='', help='Drive folder')
+        '--extent', default=None, nargs='+', metavar='xmin ymin xmax ymax',
+        help='Bounding extent')
+    parser.add_argument(
+        '--folder', default='', help='Google drive sub-folder')
     parser.add_argument(
         '--mgrs', default=[], nargs='+',
         help='Space separated list of MGRS grid zone tiles')
@@ -421,13 +427,13 @@ if __name__ == '__main__':
     main(
         model_name=args.model,
         reference_et=args.reference,
-        project_id=args.project,
+        crs=f'EPSG:{args.epsg}',
         start_date=args.start,
         end_date=args.end,
-        crs=f'EPSG:{args.epsg}',
+        project_id=args.project,
+        clip_study_area=args.clip,
         drive_folder=args.folder,
-        # CGM - Extent parameter is not yet supported
-        # extent=args.extent,
+        extent=args.extent,
         mgrs_tiles=args.mgrs,
         coll_version=args.version,
         # study_area_coll_id=args.study,
