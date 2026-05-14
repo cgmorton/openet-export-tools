@@ -1,23 +1,32 @@
 import argparse
 from datetime import datetime, timedelta
+import json
 import logging
 import math
+import os
 import re
 
 from dateutil.relativedelta import relativedelta
 import ee
+import numpy as np
+import rasterio
+import rasterio.shutil
+# from rasterio.windows import Window
+import xee
+import xarray
+
+#import openet.core.export
+import openet.core.utils as utils
 
 # Override the default logging level for these modules that can be verbose
 # logging.basicConfig(level=logging.INFO, format='%(message)s')
 logging.getLogger('earthengine-api').setLevel(logging.INFO)
 logging.getLogger('googleapiclient').setLevel(logging.INFO)
+logging.getLogger('rasterio').setLevel(logging.INFO)
 logging.getLogger('requests').setLevel(logging.INFO)
+logging.getLogger('xee').setLevel(logging.INFO)
+logging.getLogger('xarray').setLevel(logging.INFO)
 logging.getLogger('urllib3').setLevel(logging.INFO)
-
-
-# For now use the full collection bounding box
-# Consider adding support for filtering the collection in the future
-study_area_coll_id = 'projects/swrcb-return-flows/assets/Scheduling/DUs/All_Central_Valley_DUs'
 
 
 def main(
@@ -25,14 +34,18 @@ def main(
         reference_et,
         project_id,
         crs,
+        extent,
         start_date,
         end_date,
+        workspace,
+        study_area_coll_id='projects/ee-cmorton/assets/utah_huc8',
         clip_study_area=False,
-        drive_folder='',
-        extent=None,
+        folder='',
         mgrs_tiles=None,
         timestep='monthly',
         coll_version='v2_1',
+        export_properties_json=True,
+        cleanup=True,
 ):
     """Export OpenET Monthly Reprojected Images to Google Drive
 
@@ -50,16 +63,18 @@ def main(
         Exclusive end date in ISO date format (YYYY-MM-DD).
     crs : str
         Coordinate Reference System (crs) EPSG string (e.g. "EPSG:XXXX")
-    clip : bool
+    workspace : str
+
+    clip_study_area : bool, optional
         If True, clip to the study area collection geometry.
         Note that this may use considerable EECU.
-    drive_folder : str
+    folder : str, optional
         Images can be saved to a subfolder in your Google Drive,
         but this may cause problems with duplicate folders, so the default is
         to write to the root folder.
-    extent :
-        Bounding extent.
-    mgrs_tiles : list
+    extent : list, optional
+        Bounding extent (parameter is not currently supported).
+    mgrs_tiles : list, optional
         List of specific MGRS grid zones to process.  The default is to process
         all MGRS grid zones that intersect the study area collection.
     timestep : {'monthly'}
@@ -68,6 +83,9 @@ def main(
         OpenET collection version number.  Note that the spatial and temporal
         coverage of the two collections may vary and there is no v2.0 data
         available for 2025+.
+    export_properties_json : bool, optional
+        If True, export a properties JSON file for each image
+
     """
 
     # Other input parameters
@@ -79,8 +97,9 @@ def main(
     # Output datatype choices are "int16", "uint16", "float", "double"
     # Exporting as float prevents nodata and masking issues
     #   but does result in larger files
-    output_dtype = 'float'
-    # output_dtype = 'uint16'
+    # TODO: Add code to unscale the images if the output type is float?
+    # output_dtype = 'float'
+    output_dtype = 'uint16'
 
     # Assume a default cellsize/scale of 30m for now
     cellsize = 30
@@ -89,7 +108,8 @@ def main(
     if model_name.lower() == 'ensemble':
         variables = ['et_ensemble_mad']
     else:
-        variables = ['et']
+        variables = ['et', 'count']
+        # variables = ['et']
 
     # # A mask can be applied to the export images
     # # Mask must have values of 1 for pixels that are to be kept
@@ -116,6 +136,15 @@ def main(
         f'{region.lower()}/{timestep.lower()}/{coll_version.lower()}'
     )
 
+    if folder:
+        output_folder = f'{workspace}/{folder}'
+    else:
+        output_folder = f'{workspace}'
+    # output_folder = f'{workspace}/{model_name.lower()}/{region.lower()}/monthly/{version.lower()}'
+
+    if not os.path.isdir(output_folder):
+        os.makedirs(output_folder)
+
     # Initialize Earth Engine
     ee.Initialize(project=project_id)
 
@@ -123,16 +152,7 @@ def main(
 
     # Build a dictionary of the parameters that can be passed to the export call
     # Additional parameters will be included below
-    # The "fileDimensions" parameter may need to be modified for large images
-    export_params = {
-        'maxPixels': int(1E12),
-        'fileDimensions': 65536,  # 2**16
-        # 'fileDimensions': 36864,  # 2**15 + 2**12
-        'formatOptions': {
-            'cloudOptimized': True,
-            # 'skipEmptyTiles': True,
-        },
-    }
+    export_params = {}
 
     # TODO: Add support/checking for other projections
     # Parse the input spatial reference parameter
@@ -213,8 +233,9 @@ def main(
         logging.debug(f'Transform: {crs_transform}')
         logging.debug(f'Shape:     {shape_2d}\n')
 
-        export_params['dimensions'] = '{0}x{1}'.format(*shape_2d)
-        export_params['crsTransform'] = '[' + ','.join(map(str, crs_transform)) + ']'
+        export_params['dimensions'] = shape_2d
+        # export_params['dimensions'] = '{0}x{1}'.format(*shape_2d)
+        export_params['crs_transform'] = '[' + ','.join(map(str, crs_transform)) + ']'
 
     # Nodata values are a function of the output datatype
     nodata_values = {
@@ -263,11 +284,15 @@ def main(
         # logging.debug(f'  {iter_start_dt.strftime("%Y-%m-%d")}')
         # logging.debug(f'  {exclusive_end_date}')
 
-        # Build the export file name and description
-        export_tif = tif_name_fmt.format(date=iter_start_dt.strftime('%Y%m%d'))
-        description = export_tif.replace('.tif', '').replace('/', '_') + '_gdrive_export'
-        logging.debug(f'  {export_tif}')
-        logging.debug(f'  {description}')
+        # Build the export file names
+        tif_name = tif_name_fmt.format(date=iter_start_dt.strftime('%Y%m%d'))
+        logging.debug(f'  {tif_name}')
+
+        temp_path = f'{output_folder}/{tif_name.replace(".tif", "_temp.tif")}'
+        tif_path = f'{output_folder}/{tif_name}'
+        json_path = f'{output_folder}/{tif_name.replace(".tif", "_properties.json")}'
+        # logging.debug(f'  TIF:  {tif_path}')
+        # logging.debug(f'  JSON: {json_path}')
 
         # Build the source image collection
         month_coll = (
@@ -317,18 +342,92 @@ def main(
         # if data_mask:
         #     output_img = output_img.updateMask(data_mask)
 
+        # # Unmask to set the nodata value for the COG export
+        # # This extra code is needed to get around the bug with integer exports
+        # #   where masked pixels are set to 0
+        # # Unmasking the image (commented out below) can sometimes create
+        # #   a border around the image of 0 pixels even though it works
+        # #   correctly when exporting a single Landsat image band
+        # nodata_mask = output_img.mask().lte(0)
+        # output_img = (
+        #     nodata_mask.multiply(nodata_values[output_dtype])
+        #     .where(nodata_mask.eq(0), output_img)
+        #     .rename(output_img.bandNames())
+        # )
+
         # Unmask to set the nodata value for the COG export
         output_img = output_img.unmask(nodata_values[output_dtype])
 
-        logging.info('  Starting export task')
-        task = ee.batch.Export.image.toDrive(
-            image=output_img,
-            description=description,
-            folder=drive_folder,
-            fileNamePrefix=export_tif.replace('.tif', ''),
-            **export_params,
-        )
-        task.start()
+        ######
+
+        # Save the image to geotiff
+        # if overwrite_flag or not os.path.isfile(tif_path):
+        logging.debug('  Building output GeoTIFF')
+        with rasterio.open(
+                temp_path, 'w',
+                driver='GTiff',
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
+                compress='lzw',
+                count=len(variables),
+                dtype=output_dtype,
+                nodata=nodata_values[output_dtype],
+                height=export_params['dimensions'][1],
+                width=export_params['dimensions'][0],
+                crs=export_params['crs'],
+                transform=export_params['crs_transform'],
+        ) as output_ds:
+            for i, band_name in enumerate(variables):
+                output_ds.set_band_description(i + 1, band_name)
+                output_ds.write(
+                    np.full(export_params['shape'], nodata_values[output_dtype], dtype=output_dtype),
+                    i + 1
+                )
+
+        logging.debug('  Writing arrays')
+        for band_index, band_name in enumerate(variables):
+            logging.info(f'  Band: {band_name} ({band_index})')
+            output_xr = xarray.open_dataset(
+                output_img.select([band_name]),
+                engine='ee',
+                crs=export_params['crs'],
+                crs_transform=tuple(export_params['crs_transform']),
+                shape_2d=export_params['dimensions'],
+                executor_kwargs={'max_workers': 10}
+            )
+            output_array = output_xr[band_name].values[0, :, :]
+            with rasterio.open(temp_path, 'r+') as output_ds:
+                output_ds.write(output_array, band_index + 1)
+            del output_array
+
+        # Copy the image to a COG format
+        logging.debug(f'  Converting to COG')
+        with rasterio.open(temp_path, 'r+') as src_ds:
+            data = src_ds.read()
+            profile = src_ds.profile.copy()
+            profile.update(driver='COG', blocksize=512)
+            del profile['blockxsize']
+            del profile['blockysize']
+            del profile['tiled']
+            del profile['interleave']
+            # pprint.pprint(profile)
+            with rasterio.open(tif_path, 'w', **profile) as dst_ds:
+                dst_ds.descriptions = variables
+                dst_ds.write(data)
+
+        # Remove the temporary file
+        if cleanup:
+            rasterio.shutil.delete(temp_path, driver=None)
+
+        # if export_properties_json:
+        #     logging.debug(f'  Saving properties JSON')
+        #     # # Remove unneeded properties
+        #     # for k in ['system:footprint']:
+        #     #     if k in scene_info['properties'].keys():
+        #     #         del scene_info[k]
+        #     with open(json_path, 'w') as json_f:
+        #         json.dump(image_info['properties'], json_f, indent=4, sort_keys=True)
 
     logging.info('\nDone')
 
@@ -400,9 +499,9 @@ def arg_parse():
     parser.add_argument(
         '--epsg', type=int, metavar='EPSG:XXXX',
         help='EPSG code number for the target coordinate reference system (CRS)')
-    parser.add_argument(
-        '--extent', default=None, nargs='+', metavar='xmin ymin xmax ymax',
-        help='Bounding extent')
+    # parser.add_argument(
+    #     '--extent', default=None, nargs='+', metavar='xmin ymin xmax ymax',
+    #     help='Bounding extent')
     parser.add_argument(
         '--folder', default='', help='Google drive sub-folder')
     parser.add_argument(
@@ -411,6 +510,9 @@ def arg_parse():
     parser.add_argument(
         '--version', default='v2_1', choices=['v2_1', 'v2_0'],
         help='OpenET Collection version')
+    parser.add_argument(
+        '--workspace', metavar='PATH', default=os.path.dirname(os.path.abspath(__file__)),
+        help='Set the current working directory')
     parser.add_argument(
         '--debug', default=logging.INFO, const=logging.DEBUG,
         help='Debug level logging', action='store_const', dest='loglevel')
@@ -432,10 +534,10 @@ if __name__ == '__main__':
         end_date=args.end,
         project_id=args.project,
         clip_study_area=args.clip,
-        drive_folder=args.folder,
-        extent=args.extent,
+        # extent=args.extent,
         mgrs_tiles=args.mgrs,
         coll_version=args.version,
+        workspace=args.workspace,
         # study_area_coll_id=args.study,
     )
 

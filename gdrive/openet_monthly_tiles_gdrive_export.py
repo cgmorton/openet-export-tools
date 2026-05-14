@@ -47,16 +47,16 @@ def main(
         Inclusive end date in ISO date format (YYYY-MM-DD).
     end_date : str
         Exclusive end date in ISO date format (YYYY-MM-DD).
-    clip : bool
+    clip_study_area : bool, optional
         If True, clip to the study area collection geometry.
         Note that this may use considerable EECU.
-    drive_folder : str
+    drive_folder : str, optional
         Images can be saved to a subfolder in your Google Drive,
         but this may cause problems with duplicate folders, so the default is
         to write to the root folder.
-    extent :
-        Bounding extent.
-    mgrs_tiles : list
+    extent : list, optional
+        Bounding extent (parameter is not currently supported).
+    mgrs_tiles : list, optional
         List of specific MGRS grid zones to process.  The default is to process
         all MGRS grid zones that intersect the study area collection.
     timestep : {'monthly'}
@@ -69,6 +69,7 @@ def main(
 
     # Other input parameters
     # These may be made input function parameters in the future
+    cloud_optimized = False
 
     # File naming format (e.g. "ensemble_gridmet_monthly_20260201_10S.tif")
     tif_name_fmt = f'{model_name}_{reference_et}_{timestep}_{{date}}_{{mgrs}}.tif'
@@ -125,7 +126,7 @@ def main(
         'maxPixels': int(1E12),
         'fileDimensions': 65536,  # 2**16
         'formatOptions': {
-            'cloudOptimized': True,
+            'cloudOptimized': cloud_optimized,
             # 'skipEmptyTiles': True,
         },
     }
@@ -217,7 +218,7 @@ def main(
             # 'dimensions': '{0}x{1}'.format(*shape_2d),
             'extent': study_area_extent,
         }
-    pprint.pprint(mgrs_export_info)
+    # pprint.pprint(mgrs_export_info)
 
     ########
 
@@ -240,7 +241,6 @@ def main(
     else:
         dtype_min = None
         dtype_max = None
-
 
     # Build the date ranges to process
     iter_dates = [
@@ -410,9 +410,9 @@ def arg_parse():
     parser.add_argument(
         '--clip', default=False, action='store_true',
         help='Clip to the study area collection geometry')
-    parser.add_argument(
-        '--extent', default=None, nargs='+', metavar='xmin ymin xmax ymax',
-        help='Bounding extent')
+    # parser.add_argument(
+    #     '--extent', default=None, nargs='+', metavar='xmin ymin xmax ymax',
+    #     help='Bounding extent')
     parser.add_argument(
         '--folder', default='', help='Google drive sub-folder')
     parser.add_argument(
@@ -441,7 +441,7 @@ if __name__ == '__main__':
         end_date=args.end,
         project_id=args.project,
         clip_study_area=args.clip,
-        extent=args.extent,
+        # extent=args.extent,
         drive_folder=args.folder,
         mgrs_tiles=args.mgrs,
         coll_version=args.version,
